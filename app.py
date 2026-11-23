@@ -154,7 +154,7 @@ def change_user_password(username: str, old_password: str, new_password: str) ->
 
 # ==================== CONFIGURATION ====================
 WEB_HOST = "0.0.0.0"
-WEB_PORT = int(os.environ.get("PORT", 5001))
+WEB_PORT = int(os.environ.get("PORT", 8080))
 ACCOUNTS_FILE = "accounts.json"
 USERS_FILE = "users.json"
 TOKEN_CACHE_FILE = "token_cache.json"
