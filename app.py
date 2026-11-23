@@ -32,7 +32,8 @@ import thunderFF_pb2
 
 # ==================== WEB DASHBOARD ====================
 from dashboard_server import bot_state, start_web_dashboard
-
+import math
+import collections
 import hashlib
 
 # ==================== CRAFTLAND CONFIG ====================
@@ -50,7 +51,55 @@ CRAFTLAND_HEARTBEAT_SEC      = 1.0
 CRAFTLAND_START_RETRY        = 45.0
 CRAFTLAND_MAX_MATCH_DURATION = 700
 CRAFTLAND_MATCH_IDLE_TIMEOUT = 15.0
+# ==================== MOVEMENT & GLORY CONFIG ====================
+AUTO_MOVE_ENABLED         = True
+AUTO_MOVE_START_DELAY     = 2.0
+AUTO_MOVE_SPAWN_TIMEOUT   = 18.0
+AUTO_MOVE_LAND_TIMEOUT    = 6.0
+AUTO_MOVE_TICK_INTERVAL   = 0.1
+AUTO_MOVE_RUN_SPEED       = 546
+AUTO_MOVE_RADIUS          = 6000
+AUTO_MOVE_TURN_PER_TICK   = 25.0
+AUTO_MOVE_RESYNC_DISTANCE = 2500
+AUTO_MOVE_PIGGYBACK_ACK   = True
+AUTO_MOVE_MSG_KEYS        = list(range(0x64, 0x6E))
+AUTO_MOVE_DEFAULT_RTT     = 120
 
+GLORY_BOOST_ENABLED       = True
+GLORY_TICK_INTERVAL       = 0.05
+GLORY_ACTION_EVERY        = 0.5
+GLORY_PING_EVERY          = 0.5
+GLORY_MSG_KEYS            = list(range(0x64, 0x6E))
+
+TARGET_ARRIVAL_RADIUS     = 280.0
+TARGET_TIMEOUT            = 22.0
+ENEMY_TTL                 = 7.0
+STUCK_THRESHOLD           = 6.0
+STUCK_LOG_COOLDOWN        = 3.0
+
+ANTI_AFK_DECISION_SEC     = 2.5
+ANTI_AFK_IDLE_CHANCE      = 0.08
+ANTI_AFK_JUMP_EVERY       = 20.0
+
+ENABLE_SPEED_MOVEMENT       = True
+MOVEMENT_SPEED_MIN          = 1.0
+MOVEMENT_SPEED_MAX          = 1.4
+MOVEMENT_PATTERN            = "circle"
+MOVEMENT_TICK_MS            = 240
+MOVEMENT_RADIUS             = 180
+MOVEMENT_UPDATE_SPEED_EVERY = 4.0
+
+MOVEMENT_STATE_IDLE_CHANCE   = 0.10
+MOVEMENT_STATE_WALK_CHANCE   = 0.28
+MOVEMENT_STATE_RUN_CHANCE    = 0.32
+MOVEMENT_STATE_SPRINT_CHANCE = 0.10
+MOVEMENT_STATE_JUMP_CHANCE   = 0.08
+MOVEMENT_STATE_CROUCH_CHANCE = 0.06
+MOVEMENT_STATE_PRONE_CHANCE  = 0.06
+
+PLAYER_STATE_MAP = {"idle": 0, "walk": 1, "run": 1, "sprint": 1, "jump": 2, "crouch": 3, "prone": 4}
+MOVE_STATE_MAP   = {"idle": 0, "walk": 1, "run": 2, "sprint": 3, "jump": 4, "crouch": 1, "prone": 1}
+STATE_SPEED      = {"idle": 0, "walk": 45, "run": 70, "sprint": 95, "jump": 55, "crouch": 25, "prone": 15}
 
 def load_settings():
     """Called at startup — loads persisted map code from settings.json."""
@@ -1452,7 +1501,7 @@ async def reply_for(frame, key, mask, ack_key=0x68, ping_key=0x6D, hello_key=0x5
     return typ, None
 
 
-async def keepalive_ping(sock, ip, port, key_bytes, mask, stop_event):
+async def keepalive_ping(sock, ip, port, key_bytes, mask, stop_event, move_state=None):
     nr = (await layouts_from_mask(mask))[1]
     ping_keys = [0x66, 0x6D, 0x69, 0x6C, 0x6B, 0x6E, 0x6F, 0x70]
     loop = asyncio.get_event_loop()
@@ -1463,6 +1512,9 @@ async def keepalive_ping(sock, ip, port, key_bytes, mask, stop_event):
         pkt = await build_packet(pk, nr, 0, 3, None, 0, struct.pack("<I", counter) + b"\x00\x00\x00", key_bytes, encrypted=False)
         try:
             await loop.sock_sendto(sock, pkt, (ip, port))
+            if move_state is not None:
+                move_state.ping_sent = {c: t for c, t in move_state.ping_sent.items() if time.time() - t < 10}
+                move_state.ping_sent[counter] = time.time()
         except Exception:
             pass
         i += 1
@@ -1629,14 +1681,473 @@ async def build_craftland_auth448_packet(udp_key_hex, match_code, account_id, ma
     pkt2 = await sv_frame(0x5A, ru_layout, 2, 448, 2, 1, body, udp_key)
     return pkt1.hex(), pkt2.hex()
 
+# ==================== MOVEMENT (2001 / 2002 / 2003) ====================
+def read_varint(data: bytes, offset: int) -> Tuple[int, int]:
+    r, s = 0, 0
+    while True:
+        if offset >= len(data):
+            raise IndexError("offset out of bounds")
+        b = data[offset]
+        offset += 1
+        r |= (b & 0x7F) << s
+        if not (b & 0x80):
+            break
+        s += 7
+    return r, offset
+
+
+MSG_PLAYER_STATE_SYNC = next(
+    (mid for mid, name in MESSAGE_ID_TO_NAME.items() if name == "UDP_PLAYER_STATE_SYNC"),
+    2001,
+)
+
+
+async def zigzag_encode(n):
+    z = ((n << 1) ^ (n >> 63)) & 0xFFFFFFFFFFFFFFFF
+    return await uleb_encode(z)
+
+
+def zigzag_decode(n):
+    return (n >> 1) ^ -(n & 1)
+
+
+def read_varints(buf):
+    out = []
+    off = 0
+    while off < len(buf):
+        v, off = read_varint(buf, off)
+        out.append(v)
+    return out
+
+
+def float_to_u32(f):
+    return struct.unpack("<I", struct.pack("<f", float(f) + 0.0))[0]
+
+
+class MoveState:
+    def __init__(self):
+        self.session_start = time.time()
+        self.slot = None
+        self.player_id = None
+        self.server_pos = None
+        self.server_physx_state = None
+        self.server_vel_y = 0
+        self.server_update_seq = 0
+        self.pending_ack = None
+        self.rtt_ms = None
+        self.ping_sent = {}
+        self.cmd_counts = collections.Counter()
+        self.undecoded = 0
+        self.owner_uid = None
+        self.enemy_positions = {}
+        self.target = None
+        self.target_set_at = 0.0
+
+    def diagnostics(self):
+        top = ", ".join(f"{c}x{n}" for c, n in self.cmd_counts.most_common(8)) or "none"
+        return f"cmds[{top}] | undecoded {self.undecoded} | 2001 seq {self.server_update_seq} | slot {self.slot}"
+
+    def on_server_frame(self, frame):
+        self.cmd_counts[frame["cmd"]] += 1
+        if frame.get("kind") == "RUDP" and frame.get("orderId") is not None:
+            oid = frame["orderId"]
+            if self.pending_ack is None or ((oid - self.pending_ack) & 0xFFFF) < 0x8000:
+                self.pending_ack = oid
+
+        if frame["cmd"] == 101:
+            c = frame.get("content") or b""
+            try:
+                _, p = read_varint(c, 0)
+                _, p = read_varint(c, p)
+                self.player_id, _ = read_varint(c, p)
+            except Exception:
+                pass
+
+        if frame["cmd"] == MSG_PLAYER_STATE_SYNC:
+            self._on_own_state(frame["content"] or b"")
+        elif frame["cmd"] == 3:
+            c = frame.get("content") or b""
+            if len(c) >= 4:
+                sent = self.ping_sent.pop(struct.unpack_from("<I", c, 0)[0], None)
+                if sent is not None:
+                    self.rtt_ms = int((time.time() - sent) * 1000)
+
+    def _on_own_state(self, content):
+        try:
+            v = read_varints(content)
+        except Exception:
+            return
+        if len(v) < 16 or v[0] != 0 or v[1] != 2:
+            return
+        self.slot = v[2]
+        self.server_pos = (zigzag_decode(v[3]), zigzag_decode(v[4]), zigzag_decode(v[5]))
+        self.server_vel_y = zigzag_decode(v[12])
+        self.server_physx_state = v[14]
+        self.server_update_seq += 1
+        try:
+            self._try_parse_extra_players(v)
+        except Exception:
+            pass
+
+    def _try_parse_extra_players(self, v):
+        own = self.slot
+        idx = 27
+        now = time.time()
+        while idx + 3 < len(v):
+            slot = v[idx]
+            if 1 <= slot <= 50 and slot != own:
+                try:
+                    px = zigzag_decode(v[idx + 1])
+                    py = zigzag_decode(v[idx + 2])
+                    pz = zigzag_decode(v[idx + 3])
+                    if -10000 <= px <= 10000 and -2000 <= py <= 5000 and -10000 <= pz <= 10000:
+                        self.enemy_positions[slot] = (px, py, pz, now)
+                        idx += 4
+                        continue
+                except Exception:
+                    pass
+            idx += 1
+
+    def nearest_enemy(self, from_pos):
+        now = time.time()
+        self.enemy_positions = {
+            s: p for s, p in self.enemy_positions.items() if now - p[3] < ENEMY_TTL
+        }
+        if not self.enemy_positions:
+            return None
+        best = None
+        best_d = float("inf")
+        for p in self.enemy_positions.values():
+            d = math.hypot(p[0] - from_pos[0], p[2] - from_pos[2])
+            if d < best_d:
+                best_d = d
+                best = (p[0], p[1], p[2])
+        return best
+
+
+async def build_player_state_sync_2001(key_bytes, mask, msg_key, slot, pos, stick, move_input, vel,
+                                       physx_state, physx_pose, facing, net_tick, counter_ms,
+                                       ack_order=None):
+    body = bytearray()
+    body += await uleb_encode((1 << 24) | int(slot))
+    for value in (*pos, *stick, *move_input, *vel):
+        body += await zigzag_encode(int(round(value)))
+    body += await uleb_encode(int(physx_state))
+    body += await uleb_encode(int(physx_pose))
+    for f in facing:
+        body += await uleb_encode(float_to_u32(f))
+    body += b"\x00\x00"
+    body += await uleb_encode(int(net_tick))
+    body += b"\x00\x00\x00"
+    body += await uleb_encode(int(counter_ms))
+    body = bytes(body)
+
+    k = key_bytes[0]
+    v80 = ((k << 8) | k) & 0xFFFF
+    flags = 4 if ack_order is not None else 0
+    nr = (await layouts_from_mask(mask))[1]
+    hdr = bytearray([msg_key & 0xFF, 0])
+    hdr += await encode_header(nr, 0, MSG_PLAYER_STATE_SYNC, None, flags, len(body), k, v80)
+    if ack_order is not None:
+        a = ((int(ack_order) & 0xFFFF) ^ v80) & 0xFFFF
+        hdr += bytes([a & 0xFF, a >> 8, k])
+    packet = bytearray(hdr + body)
+    packet[1] = await crc7_buff(0, bytes(packet[2:])) & 0x7F
+    return bytes(packet)
+
+
+async def build_action_beacon_2002(key_bytes, mask, msg_key, slot, pos, action_type=1, ack_order=None):
+    body = bytearray()
+    body += await uleb_encode((2 << 24) | int(slot))
+    body += await zigzag_encode(int(pos[0]))
+    body += await zigzag_encode(int(pos[2]))
+    body += await uleb_encode(int(action_type))
+    body += b"\x00\x00"
+    k = key_bytes[0]
+    v80 = ((k << 8) | k) & 0xFFFF
+    nr = (await layouts_from_mask(mask))[1]
+    hdr = bytearray([msg_key & 0xFF, 0])
+    hdr += await encode_header(nr, 0, 2002, None, 4 if ack_order else 0, len(body), k, v80)
+    if ack_order:
+        a = ((int(ack_order) & 0xFFFF) ^ v80) & 0xFFFF
+        hdr += bytes([a & 0xFF, a >> 8, k])
+    pkt = bytearray(hdr + body)
+    pkt[1] = await crc7_buff(0, bytes(pkt[2:])) & 0x7F
+    return bytes(pkt)
+
+
+async def build_position_heartbeat_2003(key_bytes, mask, msg_key, slot, pos, ack_order=None):
+    body = bytearray()
+    body += await uleb_encode((3 << 24) | int(slot))
+    for v in (pos[0], pos[1], pos[2]):
+        body += await zigzag_encode(int(v))
+    body += b"\x00\x00\x00\x00"
+    k = key_bytes[0]
+    v80 = ((k << 8) | k) & 0xFFFF
+    nr = (await layouts_from_mask(mask))[1]
+    hdr = bytearray([msg_key & 0xFF, 0])
+    hdr += await encode_header(nr, 0, 2003, None, 4 if ack_order else 0, len(body), k, v80)
+    if ack_order:
+        a = ((int(ack_order) & 0xFFFF) ^ v80) & 0xFFFF
+        hdr += bytes([a & 0xFF, a >> 8, k])
+    pkt = bytearray(hdr + body)
+    pkt[1] = await crc7_buff(0, bytes(pkt[2:])) & 0x7F
+    return bytes(pkt)
+
+
+async def build_extra_ping_cmd3(key_bytes, mask, msg_key, counter):
+    body = struct.pack("<I", counter & 0xFFFFFFFF) + b"\x00\x00\x00"
+    k = key_bytes[0]
+    v80 = ((k << 8) | k) & 0xFFFF
+    nr = (await layouts_from_mask(mask))[1]
+    hdr = bytearray([msg_key & 0xFF, 0])
+    hdr += await encode_header(nr, 0, 3, None, 0, len(body), k, v80)
+    pkt = bytearray(hdr + body)
+    pkt[1] = await crc7_buff(0, bytes(pkt[2:])) & 0x7F
+    return bytes(pkt)
+
+
+async def auto_move_loop(sock, ip, port, key_bytes, mask, state: MoveState, stop_event, label=""):
+    loop = asyncio.get_event_loop()
+
+    async def wait(seconds):
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    next_report = time.time() + AUTO_MOVE_SPAWN_TIMEOUT
+    landed_deadline = None
+    while True:
+        if state.slot is not None and state.server_pos is not None:
+            if landed_deadline is None:
+                landed_deadline = time.time() + AUTO_MOVE_LAND_TIMEOUT
+            if (state.server_physx_state == 0 and state.server_vel_y == 0) or time.time() > landed_deadline:
+                break
+        elif time.time() > next_report:
+            print_warning(f"[MOVE]{label} spawn timeout — forcing start: {state.diagnostics()}")
+            state.slot = state.slot or 1
+            state.server_pos = state.server_pos or (0, 0, 0)
+            state.server_physx_state = 0
+            state.server_vel_y = 0
+            break
+        if await wait(0.2):
+            return
+
+    if await wait(AUTO_MOVE_START_DELAY):
+        return
+
+    if state.slot is None:
+        state.slot = 1
+    if state.server_pos is None:
+        state.server_pos = (0, 0, 0)
+
+    pos = list(state.server_pos)
+    seen_seq = state.server_update_seq
+    heading = random.uniform(-math.pi, math.pi)
+    stick = (math.sin(heading) * 100, 0.0, math.cos(heading) * 100)
+    last_send = time.time()
+    last_pos = tuple(pos)
+    stuck_timer = 0.0
+    last_stuck_log = 0.0
+
+    afk_decision_at = time.time() + ANTI_AFK_DECISION_SEC
+    afk_jump_at = time.time() + ANTI_AFK_JUMP_EVERY
+    cur_state = "run"
+    cur_speed_update = time.time()
+    speed_mult = 1.0
+    circle_angle = random.uniform(-math.pi, math.pi)
+    circle_dir = random.choice([-1, 1])
+
+    last_glory_ping = 0.0
+    last_action_beacon = 0.0
+    last_pos_hb = 0.0
+
+    print_success(f"[MOVE]{label} Started | uid={state.owner_uid} slot={state.slot} spawn={[round(x) for x in pos]}")
+
+    while not stop_event.is_set():
+        now = time.time()
+        dt_ms = (now - last_send) * 1000.0
+        last_send = now
+
+        if state.server_update_seq != seen_seq and state.server_pos:
+            seen_seq = state.server_update_seq
+            sx, sy, sz = state.server_pos
+            if math.hypot(sx - pos[0], sz - pos[2]) > AUTO_MOVE_RESYNC_DISTANCE:
+                pos = [sx, sy, sz]
+
+        moved = math.hypot(pos[0] - last_pos[0], pos[2] - last_pos[2])
+        if moved < 4.0:
+            stuck_timer += AUTO_MOVE_TICK_INTERVAL
+        else:
+            stuck_timer = 0.0
+            last_pos = tuple(pos)
+        if stuck_timer > STUCK_THRESHOLD and (now - last_stuck_log) > STUCK_LOG_COOLDOWN:
+            last_stuck_log = now
+            state.target = None
+
+        target_age = (now - state.target_set_at) if state.target else 999
+        nearest = state.nearest_enemy(pos)
+        if nearest is not None:
+            state.target = nearest
+            state.target_set_at = now
+        elif state.target is None or target_age > TARGET_TIMEOUT:
+            ang = random.uniform(-math.pi, math.pi)
+            dist = random.uniform(1200, AUTO_MOVE_RADIUS)
+            state.target = (pos[0] + math.sin(ang) * dist, pos[1], pos[2] + math.cos(ang) * dist)
+            state.target_set_at = now
+
+        if ENABLE_SPEED_MOVEMENT and (now - cur_speed_update) >= MOVEMENT_UPDATE_SPEED_EVERY:
+            cur_speed_update = now
+            speed_mult = random.uniform(MOVEMENT_SPEED_MIN, MOVEMENT_SPEED_MAX)
+
+        if now >= afk_decision_at:
+            afk_decision_at = now + ANTI_AFK_DECISION_SEC
+            weights = [
+                ("idle", MOVEMENT_STATE_IDLE_CHANCE),
+                ("walk", MOVEMENT_STATE_WALK_CHANCE),
+                ("run", MOVEMENT_STATE_RUN_CHANCE),
+                ("sprint", MOVEMENT_STATE_SPRINT_CHANCE),
+                ("jump", MOVEMENT_STATE_JUMP_CHANCE),
+                ("crouch", MOVEMENT_STATE_CROUCH_CHANCE),
+                ("prone", MOVEMENT_STATE_PRONE_CHANCE),
+            ]
+            r = random.uniform(0, sum(w for _, w in weights))
+            acc = 0.0
+            cur_state = "run"
+            for name, w in weights:
+                acc += w
+                if r <= acc:
+                    cur_state = name
+                    break
+            if random.random() < ANTI_AFK_IDLE_CHANCE:
+                heading += random.uniform(-math.pi, math.pi)
+                stick = (math.sin(heading) * 100, 0.0, math.cos(heading) * 100)
+
+        move_input = (0, 0)
+        vel = (0, 0, 0)
+        pose = 0
+        chasing = False
+
+        if state.target is not None:
+            dx = state.target[0] - pos[0]
+            dz = state.target[2] - pos[2]
+            if math.hypot(dx, dz) < TARGET_ARRIVAL_RADIUS:
+                state.target = None
+            else:
+                chasing = True
+                speed = AUTO_MOVE_RUN_SPEED * speed_mult
+                step = speed * dt_ms / 100.0
+                want = math.atan2(dx, dz)
+                diff = (want - heading + math.pi) % (2 * math.pi) - math.pi
+                max_turn = math.radians(AUTO_MOVE_TURN_PER_TICK)
+                heading += max(-max_turn, min(max_turn, diff))
+                ux, uz = math.sin(heading), math.cos(heading)
+                stick = (ux * 100, 0.0, uz * 100)
+                move_input = (stick[0], stick[2])
+                vel = (ux * speed, 0, uz * speed)
+                pose = MOVE_STATE_MAP.get("run", 2)
+                pos[0] += ux * step
+                pos[2] += uz * step
+
+        if not chasing:
+            if cur_state == "idle":
+                pose = PLAYER_STATE_MAP["idle"]
+            else:
+                if MOVEMENT_PATTERN == "circle":
+                    circle_angle += circle_dir * (MOVEMENT_TICK_MS / 1000.0) * 1.2
+                    wx = pos[0] + math.sin(circle_angle) * MOVEMENT_RADIUS
+                    wz = pos[2] + math.cos(circle_angle) * MOVEMENT_RADIUS
+                else:
+                    if random.random() < 0.05:
+                        heading += random.uniform(-math.pi / 3, math.pi / 3)
+                    wx = pos[0] + math.sin(heading) * MOVEMENT_RADIUS
+                    wz = pos[2] + math.cos(heading) * MOVEMENT_RADIUS
+
+                dx, dz = wx - pos[0], wz - pos[2]
+                if abs(dx) + abs(dz) < 1.0:
+                    dx, dz = math.sin(heading), math.cos(heading)
+                want = math.atan2(dx, dz)
+                diff = (want - heading + math.pi) % (2 * math.pi) - math.pi
+                heading += max(-math.radians(15), min(math.radians(15), diff))
+                ux, uz = math.sin(heading), math.cos(heading)
+
+                speed = STATE_SPEED.get(cur_state, 70) * speed_mult
+                step = speed * dt_ms / 100.0
+                stick = (ux * 100, 0.0, uz * 100)
+                move_input = (stick[0], stick[2])
+                vel = (ux * speed, 0, uz * speed)
+                pose = MOVE_STATE_MAP.get(cur_state, 1)
+                pos[0] += ux * step
+                pos[2] += uz * step
+
+            if now >= afk_jump_at:
+                afk_jump_at = now + ANTI_AFK_JUMP_EVERY
+                pose = PLAYER_STATE_MAP["jump"]
+
+        facing = (math.sin(heading), 0.0, math.cos(heading))
+        rtt = state.rtt_ms if state.rtt_ms is not None else AUTO_MOVE_DEFAULT_RTT
+        ack = None
+        if AUTO_MOVE_PIGGYBACK_ACK and state.pending_ack is not None:
+            ack, state.pending_ack = state.pending_ack, None
+
+        try:
+            pkt = await build_player_state_sync_2001(
+                key_bytes, mask, random.choice(AUTO_MOVE_MSG_KEYS), state.slot,
+                pos, stick, move_input, vel, 0, pose, facing,
+                max(1, min(1000, rtt)), int((now - state.session_start) * 1000), ack_order=ack
+            )
+            await loop.sock_sendto(sock, pkt, (ip, port))
+        except Exception:
+            pass
+
+        if GLORY_BOOST_ENABLED:
+            if now - last_glory_ping >= GLORY_PING_EVERY:
+                last_glory_ping = now
+                try:
+                    p = await build_extra_ping_cmd3(
+                        key_bytes, mask, random.choice(GLORY_MSG_KEYS), int(now * 1000) & 0xFFFFFFFF
+                    )
+                    await loop.sock_sendto(sock, p, (ip, port))
+                except Exception:
+                    pass
+
+            if now - last_action_beacon >= GLORY_ACTION_EVERY:
+                last_action_beacon = now
+                try:
+                    b = await build_action_beacon_2002(
+                        key_bytes, mask, random.choice(GLORY_MSG_KEYS),
+                        state.slot, pos, action_type=random.choice([1, 2, 3, 4])
+                    )
+                    await loop.sock_sendto(sock, b, (ip, port))
+                except Exception:
+                    pass
+
+            if now - last_pos_hb >= GLORY_ACTION_EVERY:
+                last_pos_hb = now
+                try:
+                    hb = await build_position_heartbeat_2003(
+                        key_bytes, mask, random.choice(GLORY_MSG_KEYS), state.slot, pos
+                    )
+                    await loop.sock_sendto(sock, hb, (ip, port))
+                except Exception:
+                    pass
+
+        if await wait(GLORY_TICK_INTERVAL if GLORY_BOOST_ENABLED else AUTO_MOVE_TICK_INTERVAL):
+            return
 
 async def play_game_craftland(server_ip_port, auth448_pkt1_hex, auth448_pkt2_hex,
                               udp_key, match_code, account_id, match_id, match_index):
     match_start_time = time.time()
     ping_task = None
+    move_task = None
+    force_move_task = None
     sock = None
     ping_stop = asyncio.Event()
+    move_state = MoveState()
     uid_str = str(account_id)
+    move_state.owner_uid = uid_str
     completed_cleanly = False
 
     try:
@@ -1666,7 +2177,7 @@ async def play_game_craftland(server_ip_port, auth448_pkt1_hex, auth448_pkt2_hex
         send_lock = asyncio.Lock()
 
         ping_task = asyncio.create_task(
-            keepalive_ping(sock, resolved_ip, port, udp_key_bytes, match_code, ping_stop)
+            keepalive_ping(sock, resolved_ip, port, udp_key_bytes, match_code, ping_stop, move_state)
         )
         last_activity = time.time()
         ack_top, ack_sent_at = None, 0.0
@@ -1676,8 +2187,20 @@ async def play_game_craftland(server_ip_port, auth448_pkt1_hex, auth448_pkt2_hex
             Colors.MAGENTA
         )
 
+        async def force_move_after_delay():
+            nonlocal move_task
+            await asyncio.sleep(12.0)
+            if AUTO_MOVE_ENABLED and move_task is None:
+                print_warning(f"[MOVE][CRAFTLAND #{match_index}] FORCE-START (12s fallback)")
+                move_task = asyncio.create_task(
+                    auto_move_loop(sock, resolved_ip, port, udp_key_bytes, match_code,
+                                   move_state, ping_stop, label=f"[CRAFTLAND #{match_index}]")
+                )
+
+        force_move_task = asyncio.create_task(force_move_after_delay())
+
         async def send_auth448():
-            nonlocal phase, auth_sent
+            nonlocal phase, auth_sent, move_task
             if auth_sent:
                 return
             async with send_lock:
@@ -1690,6 +2213,11 @@ async def play_game_craftland(server_ip_port, auth448_pkt1_hex, auth448_pkt2_hex
                     await asyncio.sleep(0.6)
                     await loop.sock_sendto(sock, bytes.fromhex(auth448_pkt2_hex), (resolved_ip, port))
                     print_success(f"[CRAFTLAND #{match_index}] JOIN(3043) + AUTH(448) sent!")
+                    if AUTO_MOVE_ENABLED and move_task is None:
+                        move_task = asyncio.create_task(
+                            auto_move_loop(sock, resolved_ip, port, udp_key_bytes, match_code,
+                                           move_state, ping_stop, label=f"[CRAFTLAND #{match_index}]")
+                        )
                 except Exception as e:
                     print_error(f"[CRAFTLAND #{match_index}] auth448 err: {e}")
 
@@ -1705,6 +2233,7 @@ async def play_game_craftland(server_ip_port, auth448_pkt1_hex, auth448_pkt2_hex
                     last_activity = time.time()
                     frame = await decode_packet(response, udp_key_bytes, match_code)
                     if not frame:
+                        move_state.undecoded += 1
                         oid = await peek_reliable_order(response, udp_key_bytes, match_code)
                         if oid is not None:
                             nxt = (oid + 1) & 0xFFFF
@@ -1722,6 +2251,7 @@ async def play_game_craftland(server_ip_port, auth448_pkt1_hex, auth448_pkt2_hex
                                     pass
                         continue
 
+                    move_state.on_server_frame(frame)
                     cmd = frame.get('cmd')
                     order_id = frame.get('orderId')
                     flags = frame.get('flags', 0)
@@ -1826,12 +2356,15 @@ async def play_game_craftland(server_ip_port, auth448_pkt1_hex, auth448_pkt2_hex
             except Exception:
                 pass
         ping_stop.set()
-        if ping_task:
-            ping_task.cancel()
-            try:
-                await ping_task
-            except asyncio.CancelledError:
-                pass
+        for t in (force_move_task, move_task, ping_task):
+            if t:
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
         if sock:
             try:
                 sock.close()
